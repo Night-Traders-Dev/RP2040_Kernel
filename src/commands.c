@@ -15,6 +15,7 @@
 #include "metrics.h"
 #include "uart_log.h"
 #include "governors_rp2040_perf.h"
+#include "persist.h"
 
 /* Safe MMIO address range for peek/poke. */
 #define SAFE_ADDR_MIN      0x10000000UL
@@ -165,6 +166,25 @@ static void cmd_metrics(const char *args)
             g->export_stats(s, sizeof(s));
             printf("%s\n", s);
         }
+    }
+}
+
+static void cmd_persist(const char *args)
+{
+    (void)args;
+    char name[64];
+    if (persist_load(name, sizeof(name)) == 0) {
+        printf("Persisted governor: %s\n", name);
+    } else {
+        printf("No persisted governor found\n");
+    }
+
+    /* Check for saved rp2040_perf params */
+    struct { char _pad[4]; } buf; /* we only test existence */
+    if (persist_load_rp_params(&buf, sizeof(buf)) > 0) {
+        printf("rp2040_perf parameters: present in flash\n");
+    } else {
+        printf("rp2040_perf parameters: not found\n");
     }
 }
 
@@ -370,6 +390,7 @@ static const Command commands[] = {
     { "bootsel", cmd_bootsel, "bootsel",             "Reboot into UF2 flash mode"                   },
     { "reboot",  cmd_reboot,  "reboot",              "Restart system"                               },
     { "metrics", cmd_metrics, "metrics",             "Show aggregated app-submitted metrics"        },
+    { "persist", cmd_persist, "persist",           "Show persisted governor and rp_params status" },
     { "help",    cmd_help,    "help",                "Show this help"                               },
     { "gov",     cmd_gov,     "gov <list|set|status>","Governor controls (list/set/status)"         },
     { "clear",   cmd_clear,   "clear",               "Clear the screen"                             },

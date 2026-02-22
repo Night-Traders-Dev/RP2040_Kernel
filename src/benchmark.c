@@ -48,6 +48,7 @@ static void measure_cpu(uint32_t ms, uint64_t *out_iters, double *out_secs)
     uint64_t last_stats_us = start_us;
     volatile uint32_t acc = 0;
     uint64_t iter = 0;
+    uint64_t last_iter_snapshot = 0;
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         acc += (uint32_t)(iter ^ (iter << 1));
         iter++;
@@ -55,9 +56,18 @@ static void measure_cpu(uint32_t ms, uint64_t *out_iters, double *out_secs)
         /* Periodically submit high-intensity metrics (every ~100ms) for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
         if (now_us - last_metric_us >= 100000) {
-            metrics_submit(100, 90, 100);  /* workload=100, intensity=90%, duration=100ms */
+            /* Estimate intensity from iterations in last interval */
+            uint64_t iters_done = iter - last_iter_snapshot;
+            last_iter_snapshot = iter;
+            /* Rough calibration: assume ~5,000,000 iters/100ms ~ 100% */
+            double intensity = (double)iters_done / 5000000.0 * 100.0;
+            if (intensity < 1.0) intensity = 1.0;
+            if (intensity > 100.0) intensity = 100.0;
+            metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            dmesg_log("bench:cpu metric submitted (90% intensity)");
+            char buf[80];
+            snprintf(buf, sizeof(buf), "bench:cpu metric submitted (intensity=%.0f%%)", intensity);
+            dmesg_log(buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -86,17 +96,27 @@ static void measure_memcpy(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
-    uint64_t ops = 0;
+        uint64_t last_ops_snapshot = 0;
+        uint64_t ops = 0;
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         memcpy(dst, src, BUF_SIZE);
         ops++;
         
         /* Periodically submit high-intensity metrics for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
-        if (now_us - last_metric_us >= 100000) {
-            metrics_submit(100, 85, 100);  /* workload=100, intensity=85%, duration=100ms */
-            last_metric_us = now_us;
-            dmesg_log("bench:memcpy metric submitted (85% intensity)");
+            if (now_us - last_metric_us >= 100000) {
+                uint64_t ops_done = ops - last_ops_snapshot;
+                last_ops_snapshot = ops;
+                double bytes = (double)ops_done * BUF_SIZE;
+                /* Calibration: assume ~5 MB/100ms represents 100% */
+                double intensity = bytes / (5.0 * 1024.0 * 1024.0) * 100.0;
+                if (intensity < 1.0) intensity = 1.0;
+                if (intensity > 100.0) intensity = 100.0;
+                metrics_submit(100, (int)intensity, 100);
+                last_metric_us = now_us;
+                char buf[80];
+                snprintf(buf, sizeof(buf), "bench:memcpy metric submitted (intensity=%.0f%%)", intensity);
+                dmesg_log(buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -121,6 +141,7 @@ static void measure_memset(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
+    uint64_t last_ops_snapshot = 0;
     uint64_t ops = 0;
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         memset(buf, 0xA5, BUF_SIZE);
@@ -129,9 +150,17 @@ static void measure_memset(uint32_t ms, double *out_mb, double *out_secs)
         /* Periodically submit high-intensity metrics for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
         if (now_us - last_metric_us >= 100000) {
-            metrics_submit(100, 85, 100);
+            uint64_t ops_done = ops - last_ops_snapshot;
+            last_ops_snapshot = ops;
+            double bytes = (double)ops_done * BUF_SIZE;
+            double intensity = bytes / (5.0 * 1024.0 * 1024.0) * 100.0;
+            if (intensity < 1.0) intensity = 1.0;
+            if (intensity > 100.0) intensity = 100.0;
+            metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            dmesg_log("bench:memset metric submitted (85% intensity)");
+            char buf[80];
+            snprintf(buf, sizeof(buf), "bench:memset metric submitted (intensity=%.0f%%)", intensity);
+            dmesg_log(buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -157,6 +186,7 @@ static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
+    uint64_t last_bytes_snapshot = 0;
     uint64_t bytes = 0;
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         for (size_t i = 0; i < BUF_SIZE; ++i) {
@@ -167,9 +197,16 @@ static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
         /* Periodically submit high-intensity metrics for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
         if (now_us - last_metric_us >= 100000) {
-            metrics_submit(100, 80, 100);
+            uint64_t bytes_done = bytes - last_bytes_snapshot;
+            last_bytes_snapshot = bytes;
+            double intensity = (double)bytes_done / (5.0 * 1024.0 * 1024.0) * 100.0;
+            if (intensity < 1.0) intensity = 1.0;
+            if (intensity > 100.0) intensity = 100.0;
+            metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            dmesg_log("bench:mem_stream metric submitted (80% intensity)");
+            char buf[80];
+            snprintf(buf, sizeof(buf), "bench:mem_stream metric submitted (intensity=%.0f%%)", intensity);
+            dmesg_log(buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -208,6 +245,7 @@ static void measure_mem_stream_dma(uint32_t ms, double *out_mb, double *out_secs
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
+    uint64_t last_ops_snapshot = 0;
     uint64_t ops = 0;
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         dma_channel_configure(ch, &c, dst, src, BUF_SIZE, true);
@@ -217,9 +255,16 @@ static void measure_mem_stream_dma(uint32_t ms, double *out_mb, double *out_secs
         /* Periodically submit high-intensity metrics for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
         if (now_us - last_metric_us >= 100000) {
-            metrics_submit(100, 70, 100);  /* DMA is less CPU-intensive, lower intensity */
+            uint64_t ops_done = ops - last_ops_snapshot;
+            last_ops_snapshot = ops;
+            double intensity = (double)ops_done / 500.0 * 100.0; /* rough scale */
+            if (intensity < 1.0) intensity = 1.0;
+            if (intensity > 100.0) intensity = 100.0;
+            metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            dmesg_log("bench:mem_stream_dma metric submitted (70% intensity)");
+            char buf[80];
+            snprintf(buf, sizeof(buf), "bench:mem_stream_dma metric submitted (intensity=%.0f%%)", intensity);
+            dmesg_log(buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -257,6 +302,7 @@ static void measure_rand_access(uint32_t ms, double *out_accesses_k, double *out
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
+    uint64_t last_access_snapshot = 0;
     uint64_t accesses = 0;
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         uint32_t idx = rng_next() % BUF_SIZE;
@@ -266,9 +312,16 @@ static void measure_rand_access(uint32_t ms, double *out_accesses_k, double *out
         /* Periodically submit high-intensity metrics for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
         if (now_us - last_metric_us >= 100000) {
-            metrics_submit(100, 75, 100);
+            uint64_t acc_done = accesses - last_access_snapshot;
+            last_access_snapshot = accesses;
+            double intensity = (double)acc_done / 500000.0 * 100.0; /* rough calibration */
+            if (intensity < 1.0) intensity = 1.0;
+            if (intensity > 100.0) intensity = 100.0;
+            metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            dmesg_log("bench:rand_access metric submitted (75% intensity)");
+            char buf[80];
+            snprintf(buf, sizeof(buf), "bench:rand_access metric submitted (intensity=%.0f%%)", intensity);
+            dmesg_log(buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */

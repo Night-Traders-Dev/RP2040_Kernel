@@ -25,6 +25,12 @@ volatile uint32_t core1_wdt_ping    = 0;
 volatile bool     throttle_active   = false;
 volatile uint32_t current_voltage_mv = 1100;
 volatile uint32_t stat_period_ms    = 500;
+/* Global thermal management defaults */
+static const float THERMAL_BACKOFF_C = 70.0f; /* clamp when above */
+static const float THERMAL_RESTORE_C = 65.0f; /* restore when below */
+static const uint32_t THERMAL_CAP_KHZ = 200000; /* maximum safe freq when hot */
+static bool thermal_throttled = false;
+static uint64_t last_thermal_change_ms = 0;
 
 /* --------------------------------------------------------------------------
  * Voltage helpers
@@ -270,6 +276,27 @@ void core1_entry(void)
             else
                 dmesg_log(buf);
             last_stat_ms = now_ms;
+        }
+
+        /* Global thermal management: enforce a conservative cap when hot.
+         * Apply hysteresis so we don't oscillate when temperature hovers.
+         */
+        float cur_temp = read_onboard_temperature();
+        if (!thermal_throttled && cur_temp > THERMAL_BACKOFF_C) {
+            /* Enter thermal throttle: cap the target and mark active */
+            if (target_khz > THERMAL_CAP_KHZ) {
+                target_khz = THERMAL_CAP_KHZ;
+            }
+            thermal_throttled = true;
+            throttle_active = true;
+            last_thermal_change_ms = now_ms;
+            dmesg_log("THERMAL: throttle engaged - capping target");
+        } else if (thermal_throttled && cur_temp < THERMAL_RESTORE_C) {
+            /* Exit throttle: allow governors to resume normal behavior */
+            thermal_throttled = false;
+            throttle_active = false;
+            last_thermal_change_ms = now_ms;
+            dmesg_log("THERMAL: throttle released");
         }
 
         if (g && g->tick) {

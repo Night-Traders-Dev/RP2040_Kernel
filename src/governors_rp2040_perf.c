@@ -224,13 +224,6 @@ static void rp_tick(const metrics_agg_t *metrics)
                             (agg.avg_intensity >= rp_params.thr_high_intensity && 
                              agg.avg_duration_ms >= rp_params.dur_high_ms);
         
-        /* Debug: log what we see */
-        char debug_buf[128];
-        snprintf(debug_buf, sizeof(debug_buf), 
-                 "gov:tick samples=%u intensity=%.1f%% duration=%.0fms high=%u idle=%u",
-                 samples, agg.avg_intensity, agg.avg_duration_ms, high_activity, rp_in_idle_state);
-        dmesg_log(debug_buf);
-        
         /* Exit idle state aggressively when high activity detected */
         if (rp_in_idle_state && high_activity) {
             rp_in_idle_state = false;
@@ -278,8 +271,8 @@ static void rp_tick(const metrics_agg_t *metrics)
         if (new_target != target_khz && now_ms - rp_last_adjust_ms > effective_cooldown) {
             char buf[128];
             const char *ramp_dir = (new_target > target_khz) ? "up" : "down";
-            snprintf(buf, sizeof(buf), "gov:rp2040_perf metrics ramp-%s-> %u (i=%.1f%% dur=%.0fms)",
-                     ramp_dir, new_target, agg.avg_intensity, agg.avg_duration_ms);
+            snprintf(buf, sizeof(buf), "gov:rp2040_perf ramp-%s to %u kHz (intensity=%.1f%%)",
+                     ramp_dir, new_target, agg.avg_intensity);
             dmesg_log(buf);
             target_khz = new_target;
             rp_last_adjust_ms = now_ms;
