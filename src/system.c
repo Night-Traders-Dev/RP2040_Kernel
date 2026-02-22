@@ -254,7 +254,7 @@ void core1_entry(void)
     while (true) {
         const Governor *g = governors_get_current();
         metrics_agg_t agg;
-        metrics_get_aggregate(&agg, 0);
+        metrics_get_aggregate(&agg, 1);  /* CLEAR metrics each tick so each cycle sees fresh data */
 
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
         if (live_stats && (now_ms - last_stat_ms) >= stat_period_ms) {

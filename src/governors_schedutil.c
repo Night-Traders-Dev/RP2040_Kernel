@@ -5,39 +5,69 @@
 #include "governors.h"
 
 /* Schedutil-style governor: try to follow a 'utilization' estimate.
-   Here we simulate utilization by sampling temperature variance as a placeholder. */
+   Scales frequency proportionally to workload intensity. */
 
-static void sch_init(void) { }
+static uint64_t last_high_util_us = 0;
+static const uint64_t idle_backoff_cooldown_us = 500000;  /* 500ms between idle backoffs */
+static uint64_t last_idle_backoff_us = 0;
+
+static void sch_init(void) { 
+    last_high_util_us = to_us_since_boot(get_absolute_time());
+    last_idle_backoff_us = to_us_since_boot(get_absolute_time());
+}
 
 static void sch_tick(const metrics_agg_t *metrics)
 {
     core1_wdt_ping++;
     float temp = read_onboard_temperature();
+    uint64_t now_us = to_us_since_boot(get_absolute_time());
 
     /* Prefer app-reported utilization if available */
     int util;
-    if (metrics && metrics->count > 0) {
+    bool has_metrics = (metrics && metrics->count > 0);
+    
+    if (has_metrics) {
         util = (int)metrics->avg_intensity;
+        char buf[80];
+        snprintf(buf, sizeof(buf), "gov:schedutil metrics (util=%d%%)", util);
+        dmesg_log(buf);
+        if (util > 50)
+            last_high_util_us = now_us;  /* Track when we last saw meaningful activity */
     } else {
-        /* fake util: mapped from temperature (just for testing) */
-        util = (int) ( (temp - 30.0f) );
+        /* No metrics: use conservative temperature-based estimate with hysteresis */
+        util = (int) ( (temp - 32.0f) * 0.5f );  /* More conservative scaling */
     }
     if (util < 0) util = 0;
     if (util > 100) util = 100;
 
+    /* Only update target if change is >5% (hysteresis) to avoid oscillation */
     uint32_t target = MIN_KHZ + (uint32_t)((MAX_KHZ - MIN_KHZ) * util / 100);
     if (target > MAX_KHZ) target = MAX_KHZ;
     if (target < MIN_KHZ) target = MIN_KHZ;
 
-    if (target_khz != target) {
+    /* Hysteresis: only change if >5% difference from current target */
+    uint32_t current_target_percent = (target_khz - MIN_KHZ) * 100 / (MAX_KHZ - MIN_KHZ);
+    if (target_khz != target && (uint32_t)util > current_target_percent + 5 || (uint32_t)util < current_target_percent - 5) {
         target_khz = target;
-        dmesg_log("gov:schedutil adjusted target");
+        char buf[80];
+        snprintf(buf, sizeof(buf), "gov:schedutil target -> %u kHz (util=%d%%)", target, util);
+        dmesg_log(buf);
+    }
+    
+    /* Idle backoff: if no high util seen for 2s and cool, slowly decay */
+    if (!has_metrics && util < 20 && temp < 48.0f && target_khz > MIN_KHZ &&
+        (now_us - last_high_util_us > 2000000) &&
+        (now_us - last_idle_backoff_us >= idle_backoff_cooldown_us)) {
+        target_khz -= 10000;
+        if (target_khz < MIN_KHZ) target_khz = MIN_KHZ;
+        last_idle_backoff_us = now_us;
+        dmesg_log("gov:schedutil idle backoff");
     }
 
+    /* Non-blocking: ramp one step at a time instead of blocking */
     if (target_khz != current_khz)
-        ramp_to(target_khz);
+        ramp_step(target_khz);
 
-    (void)metrics;
     sleep_ms(60);
 }
 
