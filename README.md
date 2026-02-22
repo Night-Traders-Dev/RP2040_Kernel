@@ -4,13 +4,22 @@ A bare-metal dual-core kernel for the Raspberry Pi RP2040 with a pluggable CPU f
 
 ## Features
 
-- **Dual-core architecture** — Core 0 runs the interactive REPL; Core 1 runs the governor tick loop
+- **Dual-core architecture** — Core 0 runs the interactive REPL; Core 1 runs the non-blocking governor tick loop
 - **Pluggable governor system** — `ondemand`, `schedutil`, `performance`, and the RP2040-optimized `rp2040_perf` governor
-- **Safe frequency ramping** — Voltage-before-frequency sequencing with PLL-validity probing and `multicore_lockout` guards
+  - **rp2040_perf** — Aggressive metric-driven scaling with idle detection, hysteresis, and thermal awareness
+  - **All governors** — Non-blocking single-step ramps, VREG pre-warming, intensity-based decision making
+- **Safe frequency ramping** — Non-blocking `ramp_step()` with voltage-before-frequency sequencing, PLL-validity probing, and `multicore_lockout` guards
+  - Responsive: single 5 MHz step per governor tick (~40 ms) allows concurrent app execution
+  - Thermal-aware: global throttle cap applies when core temp > 70°C; restores at < 65°C
 - **Runtime governor tuning** — Adjust governor parameters at runtime via CLI; changes persist across reboots
-- **Metrics subsystem** — Apps submit workload/intensity samples; governors consume aggregated stats to make scaling decisions
-- **Benchmarking suite** — `cpu`, `memcpy`, `memset`, `mem_stream`, `rand_access`, and DMA-backed `mem_stream_dma` benchmarks runnable across all governors with CSV output
-- **`dmesg` ring buffer** — 64-entry timestamped kernel log with optional UART drain
+- **Metrics subsystem** — Apps submit workload/intensity samples (cleared each tick); governors consume aggregated stats for frequency decisions
+- **Comprehensive benchmarking suite**
+  - Workloads: `cpu`, `memcpy`, `memset`, `mem_stream`, `rand_access`, `mem_stream_dma`
+  - Dynamic intensity: measures real throughput and submits realistic workload intensity every ~100 ms
+  - Live telemetry: frequency (MHz) and temperature (°C) logged throughout execution
+  - CSV output: runnable across all governors with structured results
+  - Non-blocking: live stats update every 500 ms during benchmark run (synchronized with main loop)
+- **`dmesg` ring buffer** — 64-entry timestamped kernel log with optional UART drain; reduced noise via state-change logging
 - **Core 1 watchdog** — Core 0 monitors Core 1's heartbeat counter every 5 seconds and reboots on stall
 - **MMIO peek/poke** — Safe address-validated 32-bit register read/write from the shell
 - **Persistent storage** — Governor selection and tunable parameters survive reboot via flash

@@ -39,16 +39,28 @@ void bench_list(void)
     }
 }
 
+/* External state accessors */
+extern volatile uint32_t current_khz;
+extern float read_onboard_temperature(void);
+
 /* Measurement helpers return primary metric and seconds */
 static void measure_cpu(uint32_t ms, uint64_t *out_iters, double *out_secs)
 {
+    char log_buf[128];
+    float temp = read_onboard_temperature();
+    snprintf(log_buf, sizeof(log_buf), "[bench:cpu] START duration=%ums freq=%uMHz temp=%.1f°C", ms, current_khz/1000, temp);
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     uint64_t start_us = to_us_since_boot(get_absolute_time());
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
+    uint64_t last_progress_us = start_us;
     volatile uint32_t acc = 0;
     uint64_t iter = 0;
     uint64_t last_iter_snapshot = 0;
+    
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         acc += (uint32_t)(iter ^ (iter << 1));
         iter++;
@@ -65,9 +77,10 @@ static void measure_cpu(uint32_t ms, uint64_t *out_iters, double *out_secs)
             if (intensity > 100.0) intensity = 100.0;
             metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            char buf[80];
-            snprintf(buf, sizeof(buf), "bench:cpu metric submitted (intensity=%.0f%%)", intensity);
-            dmesg_log(buf);
+            last_progress_us = now_us;
+            snprintf(log_buf, sizeof(log_buf), "bench:cpu @%ums iters=%llu intensity=%.0f%% freq=%uMHz", 
+                (unsigned)((now_us - start_us) / 1000), (unsigned long long)iter, intensity, current_khz/1000);
+            dmesg_log(log_buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -78,9 +91,15 @@ static void measure_cpu(uint32_t ms, uint64_t *out_iters, double *out_secs)
     }
     uint64_t elapsed_us = to_us_since_boot(get_absolute_time()) - start_us;
     double secs = elapsed_us / 1e6;
+    double iter_per_sec = iter / secs;
     (void)acc;
     if (out_iters) *out_iters = iter;
     if (out_secs) *out_secs = secs;
+    
+    snprintf(log_buf, sizeof(log_buf), "[bench:cpu] END iterations=%llu time=%.3fs rate=%.1f Miter/s freq=%uMHz temp=%.1f°C",
+        (unsigned long long)iter, secs, iter_per_sec / 1e6, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
 
 /* Memory throughput helpers: use moderate buffer sizes to fit RP2040 RAM */
@@ -88,35 +107,47 @@ static void measure_cpu(uint32_t ms, uint64_t *out_iters, double *out_secs)
 
 static void measure_memcpy(uint32_t ms, double *out_mb, double *out_secs)
 {
+    char log_buf[128];
+    snprintf(log_buf, sizeof(log_buf), "[bench:memcpy] START duration=%ums bufsize=%uKB freq=%uMHz temp=%.1f°C", ms, BUF_SIZE/1024, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     uint8_t *src = malloc(BUF_SIZE);
     uint8_t *dst = malloc(BUF_SIZE);
-    if (!src || !dst) { if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; free(src); free(dst); return; }
+    if (!src || !dst) { 
+        if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; 
+        free(src); free(dst); 
+        dmesg_log("[bench:memcpy] FAILED: malloc error");
+        return; 
+    }
     for (size_t i = 0; i < BUF_SIZE; ++i) src[i] = (uint8_t)i;
     uint64_t start_us = to_us_since_boot(get_absolute_time());
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
-        uint64_t last_ops_snapshot = 0;
-        uint64_t ops = 0;
+    uint64_t last_ops_snapshot = 0;
+    uint64_t ops = 0;
+    
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         memcpy(dst, src, BUF_SIZE);
         ops++;
         
         /* Periodically submit high-intensity metrics for governor responsiveness */
         uint64_t now_us = to_us_since_boot(get_absolute_time());
-            if (now_us - last_metric_us >= 100000) {
-                uint64_t ops_done = ops - last_ops_snapshot;
-                last_ops_snapshot = ops;
-                double bytes = (double)ops_done * BUF_SIZE;
-                /* Calibration: assume ~5 MB/100ms represents 100% */
-                double intensity = bytes / (5.0 * 1024.0 * 1024.0) * 100.0;
-                if (intensity < 1.0) intensity = 1.0;
-                if (intensity > 100.0) intensity = 100.0;
-                metrics_submit(100, (int)intensity, 100);
-                last_metric_us = now_us;
-                char buf[80];
-                snprintf(buf, sizeof(buf), "bench:memcpy metric submitted (intensity=%.0f%%)", intensity);
-                dmesg_log(buf);
+        if (now_us - last_metric_us >= 100000) {
+            uint64_t ops_done = ops - last_ops_snapshot;
+            last_ops_snapshot = ops;
+            double bytes = (double)ops_done * BUF_SIZE;
+            /* Calibration: assume ~5 MB/100ms represents 100% */
+            double intensity = bytes / (5.0 * 1024.0 * 1024.0) * 100.0;
+            if (intensity < 1.0) intensity = 1.0;
+            if (intensity > 100.0) intensity = 100.0;
+            metrics_submit(100, (int)intensity, 100);
+            last_metric_us = now_us;
+            double mb_so_far = (double)(ops * BUF_SIZE) / (1024.0 * 1024.0);
+            snprintf(log_buf, sizeof(log_buf), "bench:memcpy @%ums ops=%llu MB=%.2f intensity=%.0f%% freq=%uMHz", 
+                (unsigned)((now_us - start_us) / 1000), (unsigned long long)ops, mb_so_far, intensity, current_khz/1000);
+            dmesg_log(log_buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -128,21 +159,37 @@ static void measure_memcpy(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t elapsed_us = to_us_since_boot(get_absolute_time()) - start_us;
     double secs = elapsed_us / 1e6;
     double mb = (double)(ops * BUF_SIZE) / (1024.0 * 1024.0);
+    double mb_per_sec = mb / secs;
     if (out_mb) *out_mb = mb;
     if (out_secs) *out_secs = secs;
     free(src); free(dst);
+    
+    snprintf(log_buf, sizeof(log_buf), "[bench:memcpy] END ops=%llu MB=%.2f time=%.3fs rate=%.2f MB/s freq=%uMHz temp=%.1f°C",
+        (unsigned long long)ops, mb, secs, mb_per_sec, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
 
 static void measure_memset(uint32_t ms, double *out_mb, double *out_secs)
 {
+    char log_buf[128];
+    snprintf(log_buf, sizeof(log_buf), "[bench:memset] START duration=%ums bufsize=%uKB freq=%uMHz temp=%.1f°C", ms, BUF_SIZE/1024, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     uint8_t *buf = malloc(BUF_SIZE);
-    if (!buf) { if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; return; }
+    if (!buf) { 
+        if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; 
+        dmesg_log("[bench:memset] FAILED: malloc error");
+        return; 
+    }
     uint64_t start_us = to_us_since_boot(get_absolute_time());
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
     uint64_t last_metric_us = start_us;
     uint64_t last_stats_us = start_us;
     uint64_t last_ops_snapshot = 0;
     uint64_t ops = 0;
+    
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         memset(buf, 0xA5, BUF_SIZE);
         ops++;
@@ -158,9 +205,10 @@ static void measure_memset(uint32_t ms, double *out_mb, double *out_secs)
             if (intensity > 100.0) intensity = 100.0;
             metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            char buf[80];
-            snprintf(buf, sizeof(buf), "bench:memset metric submitted (intensity=%.0f%%)", intensity);
-            dmesg_log(buf);
+            double mb_so_far = (double)(ops * BUF_SIZE) / (1024.0 * 1024.0);
+            snprintf(log_buf, sizeof(log_buf), "bench:memset @%ums ops=%llu MB=%.2f intensity=%.0f%% freq=%uMHz", 
+                (unsigned)((now_us - start_us) / 1000), (unsigned long long)ops, mb_so_far, intensity, current_khz/1000);
+            dmesg_log(log_buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -172,15 +220,30 @@ static void measure_memset(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t elapsed_us = to_us_since_boot(get_absolute_time()) - start_us;
     double secs = elapsed_us / 1e6;
     double mb = (double)(ops * BUF_SIZE) / (1024.0 * 1024.0);
+    double mb_per_sec = mb / secs;
     if (out_mb) *out_mb = mb;
     if (out_secs) *out_secs = secs;
     free(buf);
+    
+    snprintf(log_buf, sizeof(log_buf), "[bench:memset] END ops=%llu MB=%.2f time=%.3fs rate=%.2f MB/s freq=%uMHz temp=%.1f°C",
+        (unsigned long long)ops, mb, secs, mb_per_sec, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
 
 static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
 {
+    char log_buf[128];
+    snprintf(log_buf, sizeof(log_buf), "[bench:mem_stream] START duration=%ums bufsize=%uKB freq=%uMHz temp=%.1f°C", ms, BUF_SIZE/1024, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     uint8_t *buf = malloc(BUF_SIZE);
-    if (!buf) { if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; return; }
+    if (!buf) { 
+        if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; 
+        dmesg_log("[bench:mem_stream] FAILED: malloc error");
+        return; 
+    }
     for (size_t i = 0; i < BUF_SIZE; ++i) buf[i] = (uint8_t)(i & 0xFF);
     uint64_t start_us = to_us_since_boot(get_absolute_time());
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
@@ -188,6 +251,7 @@ static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t last_stats_us = start_us;
     uint64_t last_bytes_snapshot = 0;
     uint64_t bytes = 0;
+    
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         for (size_t i = 0; i < BUF_SIZE; ++i) {
             volatile uint8_t v = buf[i]; (void)v;
@@ -204,9 +268,10 @@ static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
             if (intensity > 100.0) intensity = 100.0;
             metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            char buf[80];
-            snprintf(buf, sizeof(buf), "bench:mem_stream metric submitted (intensity=%.0f%%)", intensity);
-            dmesg_log(buf);
+            double mb_so_far = (double)bytes / (1024.0 * 1024.0);
+            snprintf(log_buf, sizeof(log_buf), "bench:mem_stream @%ums passes=%llu MB=%.2f intensity=%.0f%% freq=%uMHz", 
+                (unsigned)((now_us - start_us) / 1000), (unsigned long long)(bytes / BUF_SIZE), mb_so_far, intensity, current_khz/1000);
+            dmesg_log(log_buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -218,9 +283,15 @@ static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
     uint64_t elapsed_us = to_us_since_boot(get_absolute_time()) - start_us;
     double secs = elapsed_us / 1e6;
     double mb = (double)bytes / (1024.0 * 1024.0);
+    double mb_per_sec = mb / secs;
     if (out_mb) *out_mb = mb;
     if (out_secs) *out_secs = secs;
     free(buf);
+    
+    snprintf(log_buf, sizeof(log_buf), "[bench:mem_stream] END passes=%llu MB=%.2f time=%.3fs rate=%.2f MB/s freq=%uMHz temp=%.1f°C",
+        (unsigned long long)(bytes / BUF_SIZE), mb, secs, mb_per_sec, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
 
 /* DMA-backed memory stream: repeatedly DMA-copy a buffer to a second buffer
@@ -230,9 +301,19 @@ static void measure_mem_stream(uint32_t ms, double *out_mb, double *out_secs)
 
 static void measure_mem_stream_dma(uint32_t ms, double *out_mb, double *out_secs)
 {
+    char log_buf[128];
+    snprintf(log_buf, sizeof(log_buf), "[bench:mem_stream_dma] START duration=%ums bufsize=%uKB freq=%uMHz temp=%.1f°C", ms, BUF_SIZE/1024, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     uint8_t *src = malloc(BUF_SIZE);
     uint8_t *dst = malloc(BUF_SIZE);
-    if (!src || !dst) { if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; free(src); free(dst); return; }
+    if (!src || !dst) { 
+        if (out_mb) *out_mb = 0.0; if (out_secs) *out_secs = 0.0; 
+        free(src); free(dst); 
+        dmesg_log("[bench:mem_stream_dma] FAILED: malloc error");
+        return; 
+    }
     for (size_t i = 0; i < BUF_SIZE; ++i) src[i] = (uint8_t)(i & 0xFF);
 
     int ch = dma_claim_unused_channel(true);
@@ -247,6 +328,7 @@ static void measure_mem_stream_dma(uint32_t ms, double *out_mb, double *out_secs
     uint64_t last_stats_us = start_us;
     uint64_t last_ops_snapshot = 0;
     uint64_t ops = 0;
+    
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         dma_channel_configure(ch, &c, dst, src, BUF_SIZE, true);
         dma_channel_wait_for_finish_blocking(ch);
@@ -262,9 +344,10 @@ static void measure_mem_stream_dma(uint32_t ms, double *out_mb, double *out_secs
             if (intensity > 100.0) intensity = 100.0;
             metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            char buf[80];
-            snprintf(buf, sizeof(buf), "bench:mem_stream_dma metric submitted (intensity=%.0f%%)", intensity);
-            dmesg_log(buf);
+            double mb_so_far = (double)(ops * BUF_SIZE) / (1024.0 * 1024.0);
+            snprintf(log_buf, sizeof(log_buf), "bench:mem_stream_dma @%ums ops=%llu MB=%.2f intensity=%.0f%% freq=%uMHz", 
+                (unsigned)((now_us - start_us) / 1000), (unsigned long long)ops, mb_so_far, intensity, current_khz/1000);
+            dmesg_log(log_buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -276,11 +359,17 @@ static void measure_mem_stream_dma(uint32_t ms, double *out_mb, double *out_secs
     uint64_t elapsed_us = to_us_since_boot(get_absolute_time()) - start_us;
     double secs = elapsed_us / 1e6;
     double mb = (double)(ops * BUF_SIZE) / (1024.0 * 1024.0);
+    double mb_per_sec = mb / secs;
     if (out_mb) *out_mb = mb;
     if (out_secs) *out_secs = secs;
 
     dma_channel_unclaim(ch);
     free(src); free(dst);
+    
+    snprintf(log_buf, sizeof(log_buf), "[bench:mem_stream_dma] END ops=%llu MB=%.2f time=%.3fs rate=%.2f MB/s freq=%uMHz temp=%.1f°C",
+        (unsigned long long)ops, mb, secs, mb_per_sec, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
 
 /* Simple xorshift RNG for random indices */
@@ -295,8 +384,17 @@ static inline uint32_t rng_next(void) {
 
 static void measure_rand_access(uint32_t ms, double *out_accesses_k, double *out_secs)
 {
+    char log_buf[128];
+    snprintf(log_buf, sizeof(log_buf), "[bench:rand_access] START duration=%ums bufsize=%uKB freq=%uMHz temp=%.1f°C", ms, BUF_SIZE/1024, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     uint8_t *buf = malloc(BUF_SIZE);
-    if (!buf) { if (out_accesses_k) *out_accesses_k = 0.0; if (out_secs) *out_secs = 0.0; return; }
+    if (!buf) { 
+        if (out_accesses_k) *out_accesses_k = 0.0; if (out_secs) *out_secs = 0.0; 
+        dmesg_log("[bench:rand_access] FAILED: malloc error");
+        return; 
+    }
     for (size_t i = 0; i < BUF_SIZE; ++i) buf[i] = (uint8_t)(i & 0xFF);
     uint64_t start_us = to_us_since_boot(get_absolute_time());
     uint64_t end_us = start_us + (uint64_t)ms * 1000ULL;
@@ -304,6 +402,7 @@ static void measure_rand_access(uint32_t ms, double *out_accesses_k, double *out
     uint64_t last_stats_us = start_us;
     uint64_t last_access_snapshot = 0;
     uint64_t accesses = 0;
+    
     while (to_us_since_boot(get_absolute_time()) < end_us) {
         uint32_t idx = rng_next() % BUF_SIZE;
         volatile uint8_t v = buf[idx]; (void)v;
@@ -319,9 +418,10 @@ static void measure_rand_access(uint32_t ms, double *out_accesses_k, double *out
             if (intensity > 100.0) intensity = 100.0;
             metrics_submit(100, (int)intensity, 100);
             last_metric_us = now_us;
-            char buf[80];
-            snprintf(buf, sizeof(buf), "bench:rand_access metric submitted (intensity=%.0f%%)", intensity);
-            dmesg_log(buf);
+            double kacc_so_far = (double)accesses / 1000.0;
+            snprintf(log_buf, sizeof(log_buf), "bench:rand_access @%ums acc=%llu Kacc=%.1f intensity=%.0f%% freq=%uMHz", 
+                (unsigned)((now_us - start_us) / 1000), (unsigned long long)accesses, kacc_so_far, intensity, current_khz/1000);
+            dmesg_log(log_buf);
             sleep_us(100);  /* Yield briefly to allow Core 0 REPL to update stats */
         }
         /* Update stats display every 500ms to match main loop tickrate */
@@ -333,15 +433,23 @@ static void measure_rand_access(uint32_t ms, double *out_accesses_k, double *out
     uint64_t elapsed_us = to_us_since_boot(get_absolute_time()) - start_us;
     double secs = elapsed_us / 1e6;
     double kaccess = (double)accesses / 1000.0;
+    double kacc_per_sec = kaccess / secs;
     if (out_accesses_k) *out_accesses_k = kaccess;
     if (out_secs) *out_secs = secs;
     free(buf);
+    
+    snprintf(log_buf, sizeof(log_buf), "[bench:rand_access] END accesses=%llu Kacc=%.1f time=%.3fs rate=%.1f Kacc/s freq=%uMHz temp=%.1f°C",
+        (unsigned long long)accesses, kaccess, secs, kacc_per_sec, current_khz/1000, read_onboard_temperature());
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
 
 /* Helper: run a single target and optionally produce a CSV summary */
 int bench_run_collect(const char *target, uint32_t ms, char *out, size_t out_len)
 {
+    char log_buf[128];
     if (!target) return -1;
+    
     if (strcmp(target, "cpu") == 0) {
         uint64_t iters; double secs;
         measure_cpu(ms, &iters, &secs);
@@ -384,29 +492,51 @@ int bench_run_collect(const char *target, uint32_t ms, char *out, size_t out_len
 
 int bench_run(const char *target, uint32_t ms)
 {
+    char log_buf[192];
     char csv[192];
+    const Governor *gov = governors_get_current();
+    snprintf(log_buf, sizeof(log_buf), ">>> Running benchmark %s for %ums with governor: %s", target, ms, gov ? gov->name : "unknown");
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     if (bench_run_collect(target, ms, csv, sizeof(csv)) == 0) {
         /* Also print human-readable line for interactive use */
         printf("%s\n", csv);
         dmesg_log(csv);
+        snprintf(log_buf, sizeof(log_buf), "<<< Benchmark %s completed. Results logged above.", target);
+        dmesg_log(log_buf);
+        printf("%s\n", log_buf);
         return 0;
     }
+    snprintf(log_buf, sizeof(log_buf), "!!! Benchmark %s FAILED (unknown target)", target);
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
     return -1;
 }
 
 void bench_suite(uint32_t ms_per_test, int csv)
 {
+    char log_buf[192];
     size_t n = governors_count();
     const char *targets[] = { "cpu", "memcpy", "memset", "mem_stream", "rand_access" };
     size_t tcount = sizeof(targets)/sizeof(targets[0]);
 
-    printf("Running benchmark suite: %u ms per test across %zu governors\n", ms_per_test, n);
+    snprintf(log_buf, sizeof(log_buf), "========== BENCHMARK SUITE START: %u ms per test, %zu governors, %zu benchmarks ==========", ms_per_test, n, tcount);
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
+    
     for (size_t i = 0; i < n; ++i) {
         const Governor *g = governors_get(i);
         if (!g) continue;
+        
+        snprintf(log_buf, sizeof(log_buf), "--- Switching to governor: %s", g->name);
+        dmesg_log(log_buf);
+        printf("%s\n", log_buf);
+        
         governors_set_current(g);
         /* allow governor to settle */
         sleep_ms(250);
+        
         for (size_t t = 0; t < tcount; ++t) {
             char out[256];
             if (bench_run_collect(targets[t], ms_per_test, out, sizeof(out)) == 0) {
@@ -419,5 +549,13 @@ void bench_suite(uint32_t ms_per_test, int csv)
             }
             sleep_ms(20);
         }
+        
+        snprintf(log_buf, sizeof(log_buf), "--- Governor %s: all benchmarks complete", g->name);
+        dmesg_log(log_buf);
+        printf("%s\n", log_buf);
     }
+    
+    snprintf(log_buf, sizeof(log_buf), "========== BENCHMARK SUITE END ==========");
+    dmesg_log(log_buf);
+    printf("%s\n", log_buf);
 }
