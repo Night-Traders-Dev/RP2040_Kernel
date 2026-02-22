@@ -23,9 +23,15 @@ add_library(pico_gov STATIC
     persist.c
     metrics.c
     uart_log.c
+    pio_idle.c          # PIO idle-time / jitter subsystem
 )
 
 target_include_directories(pico_gov PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Generate the C header from pio_idle.pio.
+# pico_generate_pio_header() runs pioasm, produces pio_idle.pio.h in the
+# build directory, and adds it to pico_gov's include path automatically.
+pico_generate_pio_header(pico_gov ${CMAKE_CURRENT_SOURCE_DIR}/pio_idle.pio)
 
 # Link dependencies required by the library so consumers inherit them
 target_link_libraries(pico_gov PUBLIC
@@ -39,6 +45,7 @@ target_link_libraries(pico_gov PUBLIC
     hardware_watchdog
     hardware_vreg
     hardware_pll
+    hardware_pio          # SM0/SM1 for idle measurement + jitter detection
 )
 
 # Main executable is now a thin application linking the library

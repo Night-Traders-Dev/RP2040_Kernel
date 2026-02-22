@@ -11,6 +11,7 @@
 #include "governors.h"
 #include "metrics.h"
 #include "uart_log.h"
+#include "pio_idle.h"
 
 /* Ramp constants */
 #define RAMP_STEP_KHZ        5000
@@ -189,6 +190,7 @@ bool ramp_step(uint32_t new_khz)
     }
 
     current_khz = next_khz;
+    pio_idle_notify_freq_change(current_khz);
     return (current_khz == new_khz);
 }
 

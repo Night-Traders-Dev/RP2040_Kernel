@@ -1,0 +1,116 @@
+; =============================================================================
+; pio_idle.pio  –  CPU idle measurement + heartbeat jitter detection
+;
+; Two state machines running on PIO0 at clkdiv=1 (full sys_clk resolution).
+;
+; SM0  idle_measure
+;   Input : PIO_IDLE_PIN  (Core 0 drives HIGH while in getchar spin-wait)
+;   Output: RX FIFO  –  32-bit elapsed_ticks on every falling edge
+;   Units : elapsed_us ≈ ticks × 2 × 1000 / sys_khz
+;             (loop body = 2 instructions = 2 sys-clock cycles per tick)
+;
+; SM1  period_measure
+;   Input : PIO_HB_PIN  (Core 0 emits a ≥8-cycle HIGH pulse each main loop)
+;   Output: RX FIFO  –  32-bit LOW-phase_ticks between consecutive pulses
+;   The LOW phase ≈ the full heartbeat period.
+;   Two consecutive readings that differ by > threshold signal a PLL
+;   transition or scheduling anomaly (= jitter detected).
+;   Once N consecutive readings are within ±1.5% CV the clock is stable
+;   and rp2040_perf will allow the next frequency step.
+; =============================================================================
+
+
+; -----------------------------------------------------------------------------
+; Program 0: idle_measure
+;
+; JMP_PIN = IN_BASE = PIO_IDLE_PIN  (set by idle_measure_program_init)
+; No side-set, no OUT pins.
+; FIFO: RX only, shift-right disabled, autopush threshold = 32.
+;
+; Timing:
+;   - wait 1 pin 0        : stalls until pin rises (0 extra cycles)
+;   - mov x, ~null        : 1 cycle
+;   - jmp pin still_idle  : 1 cycle  ┐  2 cycles/tick = 1 count
+;   - jmp x-- count_loop  : 1 cycle  ┘  (when pin is HIGH)
+;   - exit path (pin fell): jmp pin(1) + mov isr + push = ~4 extra cycles
+;     → subtract 4/2=2 ticks from reading for exact accounting (negligible)
+; -----------------------------------------------------------------------------
+.program idle_measure
+
+entry:                          ; label so overflow JMP can return here
+.wrap_target
+    wait 1 pin 0                ; [0] wait for IDLE_PIN to go HIGH
+    mov x, ~null                ; [1] x = 0xFFFF_FFFF  (max countdown)
+
+count_loop:                     ; [2]
+    jmp pin still_idle          ; [2] pin still HIGH → keep counting
+    mov isr, ~x                 ; [3] pin fell: elapsed = 0xFFFFFFFF − x
+    push noblock                ; [4] push to RX FIFO (drop if full, non-block)
+.wrap                           ;     → back to wait 1 pin 0
+
+still_idle:                     ; [5]
+    jmp x-- count_loop          ; [5] decrement, loop
+    jmp entry                   ; [6] x rolled over (≈8.5 s @ 500 MHz): restart
+                                ;     without pushing (measurement discarded)
+
+% c-sdk {
+#include "hardware/clocks.h"
+static inline void idle_measure_program_init(PIO pio, uint sm,
+                                             uint offset, uint pin) {
+    pio_sm_config c = idle_measure_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false); /* input */
+    sm_config_set_in_shift(&c, false, false, 32);           /* MSB-first, no autopush */
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+
+; -----------------------------------------------------------------------------
+; Program 1: period_measure
+;
+; JMP_PIN = IN_BASE = PIO_HB_PIN  (set by period_measure_program_init)
+; Measures the LOW phase between successive HIGH pulses.
+; For a brief-pulse heartbeat the LOW phase ≈ the full heartbeat period.
+;
+; Protocol (Core 0 side):
+;   gpio_put(PIO_HB_PIN, 1);
+;   __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop");  // ≥8 cycles
+;   gpio_put(PIO_HB_PIN, 0);
+;
+; This SM produces one FIFO entry per heartbeat → one entry per main-loop tick.
+; -----------------------------------------------------------------------------
+.program period_measure
+
+hb_entry:                       ; label for overflow restart
+.wrap_target
+    wait 1 pin 0                ; [0] sync: wait for any pulse HIGH
+    wait 0 pin 0                ; [1] wait for falling edge  → pin is now LOW
+    mov x, ~null                ; [2] x = 0xFFFF_FFFF, start countdown
+
+measure_loop:                   ; [3]
+    jmp pin  got_rise           ; [3] rising edge detected → period is done
+    jmp x--  measure_loop       ; [4] still LOW → keep counting
+    jmp hb_entry                ; [5] x rolled over: discard, restart
+
+got_rise:                       ; [6]
+    mov isr, ~x                 ; [6] LOW-phase ticks = 0xFFFFFFFF − x
+    push noblock                ; [7] push to RX FIFO
+.wrap                           ;     → back to hb_entry
+
+% c-sdk {
+static inline void period_measure_program_init(PIO pio, uint sm,
+                                               uint offset, uint pin) {
+    pio_sm_config c = period_measure_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false); /* input */
+    sm_config_set_in_shift(&c, false, false, 32);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

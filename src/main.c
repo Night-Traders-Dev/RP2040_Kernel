@@ -15,6 +15,7 @@
 #include "dmesg.h"
 #include "system.h"
 #include "commands.h"
+#include "pio_idle.h"   /* PIO idle-time measurement + heartbeat jitter */
 
 int main(void)
 {
@@ -29,6 +30,11 @@ int main(void)
         sleep_ms(100);
 
     dmesg_init();
+
+    /* PIO subsystem: install programs, claim SM0+SM1 on PIO0, start SMs.
+     * Must happen BEFORE multicore_launch_core1() so both output GPIOs are
+     * configured before Core 1 starts reading pio_idle_safe_to_scale(). */
+    pio_idle_init();
 
     printf("\n--- RP2040 Minishell (boot) ---\n");
     printf("Initial clock : %.2f MHz\n", clock_get_hz(clk_sys) / 1e6f);
@@ -51,7 +57,20 @@ int main(void)
     fflush(stdout);
 
     while (true) {
+        /* ---- Heartbeat pulse: SM1 measures the period between these. ----
+         * One pulse per loop iteration.  Place it before the getchar call
+         * so the measured period captures the full iteration time including
+         * any work done above.                                              */
+        pio_idle_heartbeat();
+
+        /* ---- Drain PIO FIFOs; update idle_fraction + jitter stats. ----  */
+        pio_idle_poll();
+
+        /* ---- Mark entry into idle spin. --------------------------------- */
+        pio_idle_enter();
         int c = getchar_timeout_us(0);
+        pio_idle_exit();    /* clear idle flag immediately; avoids inflating
+                             * the idle window with sleep_us() time below  */
 
         if (c == PICO_ERROR_TIMEOUT) {
             sleep_us(100);
@@ -77,6 +96,7 @@ int main(void)
             continue;
         }
 
+        /* Character received – handle line editing as before */
         if (c == '\r' || c == '\n') {
             input[idx] = '\0';
             idx = 0;

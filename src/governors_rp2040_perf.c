@@ -10,6 +10,8 @@
 #include "governors_rp2040_perf.h"
 #include <string.h>
 #include "persist.h"
+#include "pio_idle.h"
+
 
 /* RP2040-optimized high-performance governor
  * Goals:
@@ -18,6 +20,7 @@
  *  - Back off quickly on thermal excursion
  *  - Keep tick short and cooperative
  */
+
 
 /* Tunable parameters (adjustable at runtime via CLI) */
 static struct {
@@ -50,6 +53,7 @@ static struct {
     .idle_timeout_ms = 5000,
 };
 
+
 /* Parameter helpers */
 int rp2040_perf_set_param(const char *name, double val)
 {
@@ -78,10 +82,12 @@ int rp2040_perf_set_param(const char *name, double val)
         rp_params.idle_timeout_ms = (uint32_t)val; goto persist_and_ok; }
     return -1;
 
+
 persist_and_ok:
     persist_save_rp_params(&rp_params, sizeof(rp_params));
     return 0;
 }
+
 
 int rp2040_perf_get_param(const char *name, double *out)
 {
@@ -102,6 +108,7 @@ int rp2040_perf_get_param(const char *name, double *out)
     return -1;
 }
 
+
 void rp2040_perf_print_params(void)
 {
     printf("rp2040_perf parameters:\n");
@@ -119,6 +126,7 @@ void rp2040_perf_print_params(void)
     printf("  idle_timeout_ms     : %u (sustained inactivity before idle)\n", rp_params.idle_timeout_ms);
     printf("  ramp_up_cooldown_ms : %u (fast ramp-up on high activity)\n", rp_params.ramp_up_cooldown_ms);
 }
+
 
 void rp2040_perf_list_params(void)
 {
@@ -138,6 +146,7 @@ void rp2040_perf_list_params(void)
     printf("  ramp_up_cooldown_ms\n");
 }
 
+
 /* runtime stats */
 static uint32_t rp_last_adjust_ms = 0;
 static uint32_t rp_last_target_set = 0;
@@ -148,6 +157,7 @@ static uint32_t rp_last_activity_ms = 0;
 static bool rp_in_idle_state = false;
 static uint32_t rp_ramp_up_detection_time = 0;
 
+
 static void rp_export_stats(char *buf, size_t len)
 {
     if (!buf || len == 0) return;
@@ -155,15 +165,18 @@ static void rp_export_stats(char *buf, size_t len)
              rp_adjust_count, rp_last_target_set, rp_in_idle_state ? "YES" : "no", rp_idle_switch_count);
 }
 
+
 static void rp_init(void)
 {
     /* Ensure metrics subsystem is ready */
     metrics_init();
 
+
     /* Attempt to load persisted parameters if present */
     if (persist_load_rp_params(&rp_params, sizeof(rp_params)) > 0) {
         dmesg_log("gov:rp2040_perf loaded persisted params");
     }
+
 
     /* Pre-warm voltage to highest needed for MAX_KHZ */
     if (MAX_KHZ > 250000) {
@@ -179,6 +192,7 @@ static void rp_init(void)
         current_voltage_mv = 1200;
     }
 
+
     /* Start at conservative idle frequency; let activity ramp us up to MAX
        This ensures we properly detect ramp-up and log transitions. */
     target_khz = rp_params.idle_target_khz;
@@ -186,6 +200,7 @@ static void rp_init(void)
     rp_in_idle_state = true;  /* starting in idle, exit when activity detected */
     dmesg_log("gov:rp2040_perf initialized (starting at idle target)");
 }
+
 
 static void rp_tick(const metrics_agg_t *metrics)
 {
@@ -204,16 +219,19 @@ static void rp_tick(const metrics_agg_t *metrics)
     const uint32_t COOLDOWN_MS = rp_params.cooldown_ms; /* minimum time between target changes */
     const uint32_t RAMP_UP_COOLDOWN_MS = rp_params.ramp_up_cooldown_ms; /* faster cooldown for scale-up */
 
+
     /* Update activity tracking: if we see metrics, record activity time */
     if (samples > 0) {
         rp_last_activity_ms = now_ms;
         rp_ramp_up_detection_time = now_ms;  /* reset ramp-up timer on new activity */
     }
 
+
     if (samples > 0 && now_ms - rp_last_adjust_ms > COOLDOWN_MS) {
         uint32_t new_target = target_khz;
         bool should_be_idle = false;
         bool is_ramp_up = false;
+
 
         /* Detect high activity for aggressive ramp-up:
          * Trigger if either:
@@ -243,6 +261,7 @@ static void rp_tick(const metrics_agg_t *metrics)
             }
         }
 
+
         /* Use intensity + duration to choose appropriate step */
         if (high_activity) {
             new_target = MAX_KHZ; /* sustained high intensity -> max */
@@ -265,13 +284,42 @@ static void rp_tick(const metrics_agg_t *metrics)
             new_target = target_khz;
         }
 
+
         /* Apply adaptive cooldown: faster for ramp-up, slower for ramp-down */
         uint32_t effective_cooldown = (is_ramp_up && !rp_in_idle_state) ? RAMP_UP_COOLDOWN_MS : COOLDOWN_MS;
 
+
+        /* ---- PIO-gated target change ---------------------------------- */
         if (new_target != target_khz && now_ms - rp_last_adjust_ms > effective_cooldown) {
+            /* Query PIO subsystem: is the heartbeat period stable?
+               Prevents mid-benchmark frequency steps that would distort
+               timing measurements and cause jitter on peripheral buses. */
+            bool pio_ready = pio_idle_safe_to_scale(
+                0.03f,  /* idle fraction threshold (3%) */
+                3.0f,   /* jitter threshold (3%) */
+                4u);    /* consecutive stable readings needed */
+            if (!pio_ready) {
+                /* Rate-limit the log message to avoid flooding dmesg. */
+                static uint32_t s_last_deferred_ms = 0;
+                if (now_ms - s_last_deferred_ms >= 2000) {
+                    pio_idle_stats_t ps;
+                    pio_idle_get_stats(&ps);
+                    char dbuf[96];
+                    snprintf(dbuf, sizeof(dbuf),
+                             "gov:rp2040_perf scale deferred "
+                             "(jitter=%.1f%% stable=%u idle=%.0f%%)",
+                             ps.hb_jitter_pct, ps.stable_count,
+                             ps.idle_fraction * 100.0f);
+                    dmesg_log(dbuf);
+                    s_last_deferred_ms = now_ms;
+                }
+                goto rp_tick_skip_target;
+            }
+            /* PIO says it's safe: apply the new target. */
             char buf[128];
             const char *ramp_dir = (new_target > target_khz) ? "up" : "down";
-            snprintf(buf, sizeof(buf), "gov:rp2040_perf ramp-%s to %u kHz (intensity=%.1f%%)",
+            snprintf(buf, sizeof(buf),
+                     "gov:rp2040_perf ramp-%s to %u kHz (intensity=%.1f%%)",
                      ramp_dir, new_target, agg.avg_intensity);
             dmesg_log(buf);
             target_khz = new_target;
@@ -284,6 +332,9 @@ static void rp_tick(const metrics_agg_t *metrics)
                 rp_in_idle_state = true;
             }
         }
+        rp_tick_skip_target:;
+        /* --------------------------------------------------------------- */
+
     } else if (samples == 0 && !rp_in_idle_state) {
         /* NO metrics for extended period: aggressive idle entry */
         uint32_t inactivity_ms = now_ms - rp_last_activity_ms;
@@ -302,6 +353,7 @@ static void rp_tick(const metrics_agg_t *metrics)
         }
     }
 
+
     /* Monitor temperature; if too hot, reduce target quickly */
     float temp = read_onboard_temperature();
     if (temp > rp_params.temp_backoff_C && target_khz > rp_params.backoff_target_khz) {
@@ -317,6 +369,7 @@ static void rp_tick(const metrics_agg_t *metrics)
         dmesg_log("gov:rp2040_perf restoring target -> MAX");
     }
 
+
     /* If core0 hasn't reached target, ask it to ramp one step (non-blocking).
        This allows the loop to remain responsive and process new metrics
        even while frequency is ramping. */
@@ -324,9 +377,11 @@ static void rp_tick(const metrics_agg_t *metrics)
         ramp_step(target_khz);
     }
 
+
     /* Small sleep to keep tick responsive but not spin */
     sleep_ms(40);
 }
+
 
 static const Governor g = {
     .name = "rp2040_perf",
@@ -334,5 +389,6 @@ static const Governor g = {
     .tick = rp_tick,
     .export_stats = rp_export_stats,
 };
+
 
 const Governor *governor_rp2040_perf(void) { return &g; }
