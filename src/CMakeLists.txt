@@ -19,7 +19,6 @@ add_library(pico_gov STATIC
     governors_schedutil.c
     governors_performance.c
     governors_rp2040_perf.c
-    governors_kernelaware.c
     benchmark.c
     persist.c
     metrics.c
